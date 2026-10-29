@@ -339,6 +339,74 @@ func TestComputeFairnessIndex_SkewedWaits(t *testing.T) {
 	assert.Less(t, got, 0.9, "skewed waits should produce sub-1.0 fairness")
 }
 
+// fullScanFairnessIndex recomputes the index from the program map, independently
+// of the incremental aggregates maintained by RecordDispatched and eviction.
+func fullScanFairnessIndex(p *ProgramAwarePlugin) float64 {
+	var sum, sumSq, n float64
+	p.programMetrics.Range(func(_, value any) bool {
+		m, ok := value.(*ProgramMetrics)
+		if !ok || m.WaitCount() == 0 {
+			return true
+		}
+		x := m.AverageWaitTime()
+		sum += x
+		sumSq += x * x
+		n++
+		return true
+	})
+	return jainFairnessIndex(sum, sumSq, n)
+}
+
+func TestComputeFairnessIndex_MatchesFullScanAfterUpdates(t *testing.T) {
+	p := &ProgramAwarePlugin{}
+	a := p.getOrCreateMetrics("a")
+	b := p.getOrCreateMetrics("b")
+	c := p.getOrCreateMetrics("c")
+	a.RecordDispatched(time.Now().Add(-10 * time.Millisecond))
+	a.RecordDispatched(time.Now().Add(-30 * time.Millisecond))
+	b.RecordDispatched(time.Now().Add(-200 * time.Millisecond))
+	c.RecordDispatched(time.Time{}) // no wait observation: must not contribute
+
+	assert.InDelta(t, fullScanFairnessIndex(p), p.computeFairnessIndex(), 1e-9)
+}
+
+func TestComputeFairnessIndex_EvictionDropsContribution(t *testing.T) {
+	p := &ProgramAwarePlugin{}
+	a := p.getOrCreateMetrics("a")
+	b := p.getOrCreateMetrics("b")
+	a.RecordDispatched(time.Now().Add(-10 * time.Millisecond))
+	b.RecordDispatched(time.Now().Add(-500 * time.Millisecond))
+	a.RecordCompletion(time.Now())
+	b.RecordCompletion(time.Now())
+
+	// Only "a" is stale enough to evict.
+	a.mu.Lock()
+	a.lastCompletionTime = time.Now().Add(-10 * time.Second)
+	a.mu.Unlock()
+	p.evictIdle(time.Second)
+
+	_, exists := p.programMetrics.Load("a")
+	require.False(t, exists)
+	assert.Equal(t, 1.0, p.computeFairnessIndex())
+	assert.InDelta(t, fullScanFairnessIndex(p), p.computeFairnessIndex(), 1e-9)
+}
+
+func TestComputeFairnessIndex_EvictedValueCannotRecontribute(t *testing.T) {
+	p := &ProgramAwarePlugin{}
+	a := p.getOrCreateMetrics("a")
+	a.RecordDispatched(time.Now().Add(-10 * time.Millisecond))
+	a.RecordCompletion(time.Now().Add(-10 * time.Second))
+	p.getOrCreateMetrics("b").RecordDispatched(time.Now().Add(-20 * time.Millisecond))
+
+	p.evictIdle(time.Second)
+	_, exists := p.programMetrics.Load("a")
+	require.False(t, exists)
+
+	// A dispatch racing the eviction can still hold the removed value.
+	a.RecordDispatched(time.Now().Add(-500 * time.Millisecond))
+	assert.Equal(t, 1.0, p.computeFairnessIndex())
+}
+
 func TestGetOrCreateMetrics_Idempotent(t *testing.T) {
 	p := &ProgramAwarePlugin{}
 	a := p.getOrCreateMetrics("alpha")

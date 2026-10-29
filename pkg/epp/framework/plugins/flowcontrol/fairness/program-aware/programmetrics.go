@@ -28,9 +28,55 @@ type ProgramMetrics struct {
 	averageWaitTime    float64
 	waitCount          int64
 	lastCompletionTime time.Time
+	evicted            bool
+
+	// aggregates is shared with every ProgramMetrics of a plugin and is set
+	// before the value is published to the program map.
+	aggregates *fairnessAggregates
 
 	dispatchedCount atomic.Int64
 	inFlight        atomic.Int64
+}
+
+// fairnessAggregates maintains the sums behind Jain's fairness index over the
+// average wait time of programs with wait observations. RecordDispatched and
+// eviction update the sums, so Pick reads the index without visiting every
+// tracked program.
+type fairnessAggregates struct {
+	mu    sync.Mutex
+	sum   float64
+	sumSq float64
+	n     int64
+}
+
+// observe applies a change to one program's average wait time. firstWait
+// reports whether the program has just started contributing to the index.
+func (a *fairnessAggregates) observe(previous, current float64, firstWait bool) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.sum += current - previous
+	a.sumSq += current*current - previous*previous
+	if firstWait {
+		a.n++
+	}
+}
+
+// forget removes a program's contribution, if any.
+func (a *fairnessAggregates) forget(average float64, contributed bool) {
+	if !contributed {
+		return
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.sum -= average
+	a.sumSq -= average * average
+	a.n--
+}
+
+func (a *fairnessAggregates) index() float64 {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return jainFairnessIndex(a.sum, a.sumSq, float64(a.n))
 }
 
 // RecordDispatched accepts a zero enqueueTime when no queue wait was observed.
@@ -42,9 +88,31 @@ func (m *ProgramMetrics) RecordDispatched(enqueueTime time.Time) {
 	}
 	waitMs := float64(time.Since(enqueueTime).Milliseconds())
 	m.mu.Lock()
-	defer m.mu.Unlock()
+	previous := m.averageWaitTime
+	firstWait := m.waitCount == 0
 	m.waitCount++
 	m.averageWaitTime += (waitMs - m.averageWaitTime) / float64(m.waitCount)
+	current := m.averageWaitTime
+	track := m.aggregates != nil && !m.evicted
+	m.mu.Unlock()
+	if track {
+		m.aggregates.observe(previous, current, firstWait)
+	}
+}
+
+// forgetAggregates removes this program's wait contribution from the shared
+// fairness aggregates. A later RecordDispatched on the same value does not
+// re-add it.
+func (m *ProgramMetrics) forgetAggregates() {
+	if m.aggregates == nil {
+		return
+	}
+	m.mu.Lock()
+	m.evicted = true
+	average := m.averageWaitTime
+	contributed := m.waitCount > 0
+	m.mu.Unlock()
+	m.aggregates.forget(average, contributed)
 }
 
 func (m *ProgramMetrics) RecordCompletion(now time.Time) {
