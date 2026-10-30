@@ -76,7 +76,22 @@ func (a *fairnessAggregates) forget(average float64, contributed bool) {
 func (a *fairnessAggregates) index() float64 {
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	return jainFairnessIndex(a.sum, a.sumSq, float64(a.n))
+	// Accumulated rounding error can drive sumSq below zero even when every
+	// tracked program is equally served.
+	if a.sumSq <= 0 {
+		return 1.0
+	}
+	return min(1.0, max(0.0, jainFairnessIndex(a.sum, a.sumSq, float64(a.n))))
+}
+
+// reset replaces the accumulated sums. The eviction sweep uses it to discard
+// the floating-point error left behind by incremental updates.
+func (a *fairnessAggregates) reset(sum, sumSq float64, n int64) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.sum = sum
+	a.sumSq = sumSq
+	a.n = n
 }
 
 // RecordDispatched accepts a zero enqueueTime when no queue wait was observed.
@@ -124,6 +139,13 @@ func (m *ProgramMetrics) RecordCompletion(now time.Time) {
 
 func (m *ProgramMetrics) DispatchedCount() int64 { return m.dispatchedCount.Load() }
 func (m *ProgramMetrics) InFlight() int64        { return m.inFlight.Load() }
+
+// waitStats returns the average wait time and observation count together.
+func (m *ProgramMetrics) waitStats() (average float64, count int64) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.averageWaitTime, m.waitCount
+}
 
 func (m *ProgramMetrics) AverageWaitTime() float64 {
 	m.mu.Lock()

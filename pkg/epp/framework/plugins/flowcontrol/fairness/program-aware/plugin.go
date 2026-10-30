@@ -317,6 +317,30 @@ func (p *ProgramAwarePlugin) evictIdle(ttl time.Duration) {
 		p.evictKey(key)
 		return true
 	})
+	p.recomputeFairness()
+}
+
+// recomputeFairness rebuilds the aggregates from the program map. Incremental
+// updates add and subtract floating-point deltas that leave a residual, so the
+// sweep discards the accumulated error.
+func (p *ProgramAwarePlugin) recomputeFairness() {
+	var sum, sumSq float64
+	var n int64
+	p.programMetrics.Range(func(_, value any) bool {
+		m, ok := value.(*ProgramMetrics)
+		if !ok {
+			return true
+		}
+		average, count := m.waitStats()
+		if count == 0 {
+			return true
+		}
+		sum += average
+		sumSq += average * average
+		n++
+		return true
+	})
+	p.fairness.reset(sum, sumSq, n)
 }
 
 func (p *ProgramAwarePlugin) evictKey(key any) {
